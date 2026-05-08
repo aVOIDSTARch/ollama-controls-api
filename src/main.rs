@@ -14,16 +14,22 @@ use axum::{
     extract::{Query, Request, State},
     http::{header, Method, StatusCode},
     middleware::{from_fn_with_state, Next},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{delete, get, post},
     Json, Router,
 };
 use age::secrecy::SecretString;
 use ollama_controls::{
     inspect_model, inspect_model_details, list_local_downloaded_models, models_path_info,
-    ollama_start_serve, ollama_stop_serve, set_models_download_path, GenerateResponse, Model,
-    ModelsPathInfo, OllamaClient, PullProgressLine, PsResponse, ShowResponse, TagsResponse,
+    ollama_start_serve, ollama_stop_serve, set_models_download_path, ChatMessage, GenerateResponse,
+    ListedModel, Model, ModelsPathInfo, OllamaClient, OllamaChatLine, PullProgressLine, PsResponse,
+    ShowResponse, TagsResponse,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use ollama_controls_api::auth::{
     self, default_keystore_path, resolve_username_for_api_key, AuthenticatedUser, KeyStoreData,
 };
@@ -33,6 +39,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
 struct AppState {
@@ -127,14 +134,14 @@ async fn require_api_key(State(state): State<Arc<AppState>>, mut req: Request, n
         }
         Ok(Ok(None)) => json_error(StatusCode::UNAUTHORIZED, "invalid API key"),
         Ok(Err(e)) => {
-            eprintln!("api key verification error: {e}");
+            tracing::error!("api key verification error: {e}");
             json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "could not verify API key",
             )
         }
         Err(e) => {
-            eprintln!("api key verification join error: {e}");
+            tracing::error!("api key verification join error: {e}");
             json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "could not verify API key",
@@ -145,6 +152,9 @@ async fn require_api_key(State(state): State<Arc<AppState>>, mut req: Request, n
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("ollama_controls_api=info".parse().unwrap()))
+        .init();
     load_dotenv_with_exe_fallback();
 
     let bind = std::env::var("OLLAMA_CONTROLS_BIND")
@@ -175,10 +185,10 @@ async fn main() {
             .await
             .expect("load_keystore join")
             .unwrap_or_else(|e| panic!("failed to load keystore from {path_display}: {e}"));
-        eprintln!("API key authentication enabled (keystore: {path_display})");
+        tracing::info!("API key authentication enabled (keystore: {path_display})");
         Some(Arc::new(data))
     } else {
-        eprintln!("API key authentication disabled (set OLLAMA_CONTROLS_KEYSTORE_PASSPHRASE or OLLAMA_CONTROLS_REQUIRE_API_KEY=true to enable)");
+        tracing::info!("API key authentication disabled (set OLLAMA_CONTROLS_KEYSTORE_PASSPHRASE or OLLAMA_CONTROLS_REQUIRE_API_KEY=true to enable)");
         None
     };
 
@@ -186,6 +196,8 @@ async fn main() {
 
     let routes = Router::new()
         .route("/health", get(health))
+        .route("/v1/models", get(v1_models))
+        .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/api/tags", get(list_tags))
         .route("/api/ps", get(list_ps))
         .route("/api/show", get(show_model))
@@ -230,7 +242,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
-    eprintln!("ollama-controls-api listening on http://{bind}");
+    tracing::info!("listening on http://{bind}");
     axum::serve(listener, app).await.expect("server");
 }
 
@@ -541,6 +553,231 @@ async fn set_models_path(
     .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e))?;
     Ok(Json(info))
 }
+
+// --- OpenAI-compatible API types ---
+
+#[derive(serde::Deserialize)]
+struct ChatCompletionsRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    max_tokens: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct OaiModelList {
+    object: &'static str,
+    data: Vec<OaiModel>,
+}
+
+#[derive(Serialize)]
+struct OaiModel {
+    id: String,
+    object: &'static str,
+    created: i64,
+    owned_by: String,
+}
+
+#[derive(Serialize)]
+struct OaiChatCompletion {
+    id: String,
+    object: &'static str,
+    created: i64,
+    model: String,
+    choices: Vec<OaiChoice>,
+    usage: OaiUsage,
+}
+
+#[derive(Serialize)]
+struct OaiChoice {
+    index: u32,
+    message: ChatMessage,
+    finish_reason: String,
+}
+
+#[derive(Serialize)]
+struct OaiUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Serialize)]
+struct OaiChatChunk {
+    id: String,
+    object: &'static str,
+    created: i64,
+    model: String,
+    choices: Vec<OaiChunkChoice>,
+}
+
+#[derive(Serialize)]
+struct OaiChunkChoice {
+    index: u32,
+    delta: OaiDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OaiDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn new_completion_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("chatcmpl-{nanos:x}")
+}
+
+async fn v1_models(State(state): State<Arc<AppState>>) -> Result<Json<OaiModelList>, ApiError> {
+    let client = state.client.clone();
+    let models = tokio::task::spawn_blocking(move || client.list_models())
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e))?;
+    let created = unix_now();
+    let data = models
+        .into_iter()
+        .map(|m: ListedModel| OaiModel { id: m.name, object: "model", created, owned_by: "ollama".to_string() })
+        .collect();
+    Ok(Json(OaiModelList { object: "list", data }))
+}
+
+async fn v1_chat_completions(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ChatCompletionsRequest>,
+) -> Response {
+    let do_stream = body.stream.unwrap_or(false);
+    let model = body.model;
+    let messages = body.messages;
+    let temperature = body.temperature;
+    let max_tokens = body.max_tokens;
+    let created = unix_now();
+    let comp_id = new_completion_id();
+
+    if do_stream {
+        let (tx, rx) = mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+        let client = state.client.clone();
+        let cid = comp_id.clone();
+        let mdl = model.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // first chunk announces the assistant role
+            let first = OaiChatChunk {
+                id: cid.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: mdl.clone(),
+                choices: vec![OaiChunkChoice {
+                    index: 0,
+                    delta: OaiDelta { role: Some("assistant".to_string()), content: None },
+                    finish_reason: None,
+                }],
+            };
+            if let Ok(s) = serde_json::to_string(&first) {
+                let _ = tx.send(Ok(Event::default().data(s)));
+            }
+
+            let result = client.chat_stream(&mdl, messages, temperature, max_tokens, |line: &OllamaChatLine| {
+                let chunk = if line.done {
+                    OaiChatChunk {
+                        id: cid.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: mdl.clone(),
+                        choices: vec![OaiChunkChoice {
+                            index: 0,
+                            delta: OaiDelta { role: None, content: None },
+                            finish_reason: Some(
+                                line.done_reason.clone().unwrap_or_else(|| "stop".to_string()),
+                            ),
+                        }],
+                    }
+                } else {
+                    OaiChatChunk {
+                        id: cid.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: mdl.clone(),
+                        choices: vec![OaiChunkChoice {
+                            index: 0,
+                            delta: OaiDelta {
+                                role: None,
+                                content: line.message.as_ref().map(|m| m.content.clone()),
+                            },
+                            finish_reason: None,
+                        }],
+                    }
+                };
+                if let Ok(s) = serde_json::to_string(&chunk) {
+                    let _ = tx.send(Ok(Event::default().data(s)));
+                }
+                Ok(())
+            });
+
+            if let Err(e) = result {
+                let _ = tx.send(Ok(Event::default().data(
+                    serde_json::to_string(&json!({ "error": { "message": e, "type": "server_error" } }))
+                        .unwrap_or_default(),
+                )));
+            }
+
+            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+        });
+
+        Sse::new(UnboundedReceiverStream::new(rx))
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        let client = state.client.clone();
+        match tokio::task::spawn_blocking(move || client.chat_blocking(&model, messages, temperature, max_tokens))
+            .await
+        {
+            Err(e) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Ok(Err(e)) => ApiError::new(StatusCode::BAD_GATEWAY, e).into_response(),
+            Ok(Ok(line)) => {
+                let content = line.message.map(|m| m.content).unwrap_or_default();
+                let prompt_tokens = line.prompt_eval_count.unwrap_or(0);
+                let completion_tokens = line.eval_count.unwrap_or(0);
+                Json(OaiChatCompletion {
+                    id: comp_id,
+                    object: "chat.completion",
+                    created,
+                    model: line.model,
+                    choices: vec![OaiChoice {
+                        index: 0,
+                        message: ChatMessage { role: "assistant".to_string(), content },
+                        finish_reason: line.done_reason.unwrap_or_else(|| "stop".to_string()),
+                    }],
+                    usage: OaiUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                })
+                .into_response()
+            }
+        }
+    }
+}
+
+// ---
 
 struct ApiError {
     status: StatusCode,
